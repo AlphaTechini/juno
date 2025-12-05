@@ -131,6 +131,7 @@ type Config struct {
 
 	RPCRequestTimeout         time.Duration `mapstructure:"rpc-request-timeout"`
 	MaxConcurrentCompilations uint          `mapstructure:"max-concurrent-compilations"`
+	NewState                  bool          `mapstructure:"new-state"`
 }
 
 type Node struct {
@@ -194,7 +195,7 @@ func New(cfg *Config, version string, logLevel *utils.LogLevel) (*Node, error) {
 	services := make([]service.Service, 0)
 	earlyServices := make([]service.Service, 0)
 
-	chain := blockchain.New(database, &cfg.Network).
+	chain := blockchain.New(database, &cfg.Network, cfg.NewState).
 		WithTransactionLayout(cfg.TransactionCombinedLayout)
 
 	// Verify that cfg.Network is compatible with the database.

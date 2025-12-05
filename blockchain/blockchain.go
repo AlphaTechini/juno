@@ -6,6 +6,9 @@ import (
 
 	"github.com/NethermindEth/juno/core"
 	"github.com/NethermindEth/juno/core/felt"
+	"github.com/NethermindEth/juno/core/state"
+	"github.com/NethermindEth/juno/core/state/statefactory"
+	"github.com/NethermindEth/juno/core/trie2/triedb"
 	"github.com/NethermindEth/juno/db"
 	"github.com/NethermindEth/juno/db/memory"
 	"github.com/NethermindEth/juno/feed"
@@ -19,6 +22,7 @@ type L1HeadSubscription struct {
 
 //go:generate mockgen -destination=../mocks/mock_blockchain.go -package=mocks github.com/NethermindEth/juno/blockchain Reader
 type Reader interface {
+	StateProvider
 	Height() (height uint64, err error)
 
 	Head() (head *core.Block, err error)
@@ -51,10 +55,6 @@ type Reader interface {
 	StateUpdateByHash(hash *felt.Felt) (update *core.StateUpdate, err error)
 	L1HandlerTxnHash(msgHash *common.Hash) (l1HandlerTxnHash felt.Felt, err error)
 
-	HeadState() (core.StateReader, StateCloser, error)
-	StateAtBlockHash(blockHash *felt.Felt) (core.StateReader, StateCloser, error)
-	StateAtBlockNumber(blockNumber uint64) (core.StateReader, StateCloser, error)
-
 	BlockCommitmentsByNumber(blockNumber uint64) (*core.BlockCommitments, error)
 
 	EventFilter(
@@ -66,6 +66,12 @@ type Reader interface {
 	Network() *utils.Network
 }
 
+type StateProvider interface {
+	HeadState() (core.StateReader, StateCloser, error)
+	StateAtBlockHash(blockHash *felt.Felt) (core.StateReader, StateCloser, error)
+	StateAtBlockNumber(blockNumber uint64) (core.StateReader, StateCloser, error)
+}
+
 var ErrParentDoesNotMatchHead = errors.New("block's parent hash does not match head block hash")
 
 var _ Reader = (*Blockchain)(nil)
@@ -74,14 +80,24 @@ var _ Reader = (*Blockchain)(nil)
 type Blockchain struct {
 	network           *utils.Network
 	database          db.KeyValueStore
+	stateDB           *state.StateDB
 	listener          EventListener
 	l1HeadFeed        *feed.Feed[*core.L1Head]
 	cachedFilters     *AggregatedBloomFilterCache
 	runningFilter     *core.RunningEventFilter
 	transactionLayout core.TransactionLayout
+	StateFactory      *statefactory.StateFactory
 }
 
-func New(database db.KeyValueStore, network *utils.Network) *Blockchain {
+func New(database db.KeyValueStore, network *utils.Network, stateVersion bool) *Blockchain {
+	trieDB, err := triedb.New(database, nil) // TODO: handle hashdb and pathdb
+	if err != nil {
+		panic(err)
+	}
+	stateDB := state.NewStateDB(database, trieDB)
+
+	stateFactory := statefactory.NewStateFactory(stateVersion, trieDB, stateDB)
+
 	cachedFilters := NewAggregatedBloomCache(AggregatedBloomFilterCacheSize)
 	fallback := func(key EventFiltersCacheKey) (core.AggregatedBloomFilter, error) {
 		return core.GetAggregatedBloomFilter(database, key.fromBlock, key.toBlock)
@@ -92,12 +108,14 @@ func New(database db.KeyValueStore, network *utils.Network) *Blockchain {
 
 	return &Blockchain{
 		database:          database,
+		stateDB:           stateDB,
 		network:           network,
 		listener:          &SelectiveListener{},
 		l1HeadFeed:        feed.New[*core.L1Head](),
 		cachedFilters:     &cachedFilters,
 		runningFilter:     runningFilter,
 		transactionLayout: core.TransactionLayoutPerTx, // default to per-tx for backward compatibility
+		StateFactory:      stateFactory,
 	}
 }
 
@@ -306,8 +324,7 @@ func (b *Blockchain) SubscribeL1Head() L1HeadSubscription {
 
 func (b *Blockchain) L1Head() (core.L1Head, error) {
 	b.listener.OnRead("L1Head")
-	l1Head, err := core.GetL1Head(b.database)
-	return l1Head, err
+	return core.GetL1Head(b.database)
 }
 
 func (b *Blockchain) SetL1Head(update *core.L1Head) error {
@@ -317,6 +334,21 @@ func (b *Blockchain) SetL1Head(update *core.L1Head) error {
 
 // Store takes a block and state update and performs sanity checks before putting in the database.
 func (b *Blockchain) Store(
+	block *core.Block,
+	blockCommitments *core.BlockCommitments,
+	stateUpdate *core.StateUpdate,
+	newClasses map[felt.Felt]core.ClassDefinition,
+) error {
+	// old state
+	// TODO(maksymmalick): remove this once we have a new state implementation
+	if !b.StateFactory.UseNewState() {
+		return b.deprecatedStore(block, blockCommitments, stateUpdate, newClasses)
+	}
+
+	return b.store(block, blockCommitments, stateUpdate, newClasses)
+}
+
+func (b *Blockchain) deprecatedStore(
 	block *core.Block,
 	blockCommitments *core.BlockCommitments,
 	stateUpdate *core.StateUpdate,
@@ -359,6 +391,7 @@ func (b *Blockchain) Store(
 		}
 
 		err = storeCasmHashMetadata(
+			b.database,
 			txn,
 			block.Number,
 			block.ProtocolVersion,
@@ -384,7 +417,8 @@ func (b *Blockchain) Store(
 // storeCasmHashMetadata stores CASM hash metadata for declared and migrated classes.
 // See [core.ClassCasmHashMetadata]
 func storeCasmHashMetadata(
-	txn db.IndexedBatch,
+	reader db.KeyValueReader,
+	writer db.KeyValueWriter,
 	blockNumber uint64,
 	protocolVersion string,
 	stateUpdate *core.StateUpdate,
@@ -398,16 +432,17 @@ func storeCasmHashMetadata(
 	isV2Protocol := ver.GreaterThanEqual(core.Ver0_14_1)
 
 	if isV2Protocol {
-		return storeCasmHashMetadataV2(txn, blockNumber, stateUpdate)
+		return storeCasmHashMetadataV2(reader, writer, blockNumber, stateUpdate)
 	}
 
-	return storeCasmHashMetadataV1(txn, blockNumber, stateUpdate, newClasses)
+	return storeCasmHashMetadataV1(writer, blockNumber, stateUpdate, newClasses)
 }
 
 // storeCasmHashMetadataV2 stores metadata for classes declared with casm hash v2 or
 // migrated from v1. casm hash v2 is after protocol version >= 0.14.1.
 func storeCasmHashMetadataV2(
-	txn db.IndexedBatch,
+	reader db.KeyValueReader,
+	writer db.KeyValueWriter,
 	blockNumber uint64,
 	stateUpdate *core.StateUpdate,
 ) error {
@@ -417,7 +452,7 @@ func storeCasmHashMetadataV2(
 			(*felt.CasmClassHash)(casmHash),
 		)
 		err := core.WriteClassCasmHashMetadata(
-			txn,
+			writer,
 			(*felt.SierraClassHash)(&sierraClassHash),
 			&metadata,
 		)
@@ -427,7 +462,7 @@ func storeCasmHashMetadataV2(
 	}
 
 	for sierraClassHash := range stateUpdate.StateDiff.MigratedClasses {
-		metadata, err := core.GetClassCasmHashMetadata(txn, &sierraClassHash)
+		metadata, err := core.GetClassCasmHashMetadata(reader, &sierraClassHash)
 		if err != nil {
 			return fmt.Errorf("cannot migrate class %s: metadata not found",
 				sierraClassHash.String(),
@@ -442,7 +477,7 @@ func storeCasmHashMetadataV2(
 			)
 		}
 
-		err = core.WriteClassCasmHashMetadata(txn, &sierraClassHash, &metadata)
+		err = core.WriteClassCasmHashMetadata(writer, &sierraClassHash, &metadata)
 		if err != nil {
 			return err
 		}
@@ -453,7 +488,7 @@ func storeCasmHashMetadataV2(
 // storeDeclaredV1Classes stores metadata for classes declared with V1 hash (protocol < 0.14.1).
 // It computes the V2 hash from the class definition.
 func storeCasmHashMetadataV1(
-	txn db.IndexedBatch,
+	writer db.KeyValueWriter,
 	blockNumber uint64,
 	stateUpdate *core.StateUpdate,
 	newClasses map[felt.Felt]core.ClassDefinition,
@@ -482,7 +517,7 @@ func storeCasmHashMetadataV1(
 
 		metadata := core.NewCasmHashMetadataDeclaredV1(blockNumber, casmHashV1, &casmHashV2)
 		err := core.WriteClassCasmHashMetadata(
-			txn,
+			writer,
 			(*felt.SierraClassHash)(&sierraClassHash),
 			&metadata,
 		)
@@ -583,7 +618,7 @@ func (b *Blockchain) HeadState() (core.StateReader, StateCloser, error) {
 	b.listener.OnRead("HeadState")
 	txn := b.database.NewIndexedBatch()
 
-	_, err := core.GetChainHeight(txn)
+	height, err := core.GetChainHeight(txn)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -663,10 +698,22 @@ func (b *Blockchain) EventFilter(
 
 // RevertHead reverts the head block
 func (b *Blockchain) RevertHead() error {
-	return b.database.Update(b.revertHead)
+	if !b.StateFactory.UseNewState() {
+		return b.database.Update(b.deprecatedRevertHead)
+	}
+	return b.database.Write(b.revertHead)
 }
 
 func (b *Blockchain) GetReverseStateDiff() (core.StateDiff, error) {
+	if !b.StateFactory.UseNewState() {
+		return b.deprecatedGetReverseStateDiff()
+	}
+
+	return b.getReverseStateDiff()
+}
+
+// TODO(maksymmalick): remove this once we have a new state integrated
+func (b *Blockchain) deprecatedGetReverseStateDiff() (core.StateDiff, error) {
 	txn := b.database.NewIndexedBatch()
 	blockNum, err := core.GetChainHeight(txn)
 	if err != nil {
@@ -726,7 +773,7 @@ func (b *Blockchain) revertHead(txn db.IndexedBatch) error {
 		}
 	}
 
-	if err := b.transactionLayout.DeleteTxsAndReceipts(txn, blockNumber); err != nil {
+	if err := b.transactionLayout.DeleteTxsAndReceipts(b.database, txn, blockNumber); err != nil {
 		return err
 	}
 
@@ -839,6 +886,7 @@ func (b *Blockchain) updateStateRoots(
 	block *core.Block,
 	stateUpdate *core.StateUpdate,
 	newClasses map[felt.Felt]core.ClassDefinition,
+	flushChanges bool,
 ) error {
 	state := core.NewDeprecatedState(txn)
 
@@ -905,7 +953,7 @@ func (b *Blockchain) signBlock(
 
 // storeBlockData persists all block-related data to the database
 func (b *Blockchain) storeBlockData(
-	txn db.IndexedBatch,
+	txn db.KeyValueWriter,
 	block *core.Block,
 	stateUpdate *core.StateUpdate,
 	commitments *core.BlockCommitments,
