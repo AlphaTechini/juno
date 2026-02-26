@@ -421,7 +421,6 @@ func (b *Blockchain) store(
 	stateUpdate *core.StateUpdate,
 	newClasses map[felt.Felt]core.ClassDefinition,
 ) error {
-	// TODO(weiihann): handle unexpected shutdown
 	err := b.database.Write(func(batch db.Batch) error {
 		if err := verifyBlock(b.database, block); err != nil {
 			return err
