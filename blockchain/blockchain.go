@@ -10,7 +10,6 @@ import (
 	"github.com/NethermindEth/juno/core/state/statefactory"
 	"github.com/NethermindEth/juno/core/trie2/triedb"
 	"github.com/NethermindEth/juno/db"
-	"github.com/NethermindEth/juno/db/memory"
 	"github.com/NethermindEth/juno/feed"
 	"github.com/NethermindEth/juno/utils"
 	"github.com/ethereum/go-ethereum/common"
@@ -143,25 +142,6 @@ func (b *Blockchain) WithListener(listener EventListener) *Blockchain {
 
 func (b *Blockchain) Network() *utils.Network {
 	return b.network
-}
-
-// StateCommitment returns the latest block state commitment.
-// If blockchain is empty zero felt is returned.
-func (b *Blockchain) StateCommitment() (felt.Felt, error) {
-	b.listener.OnRead("StateCommitment")
-	batch := b.database.NewIndexedBatch() // this is a hack because we don't need to write to the db
-	height, err := core.GetChainHeight(batch)
-	if err != nil {
-		if errors.Is(err, db.ErrKeyNotFound) {
-			return felt.Felt{}, nil
-		}
-		return felt.Felt{}, err
-	}
-	header, err := core.GetBlockHeaderByNumber(batch, height)
-	if err != nil {
-		return felt.Felt{}, err
-	}
-	return core.NewDeprecatedState(batch).Commitment(header.ProtocolVersion)
 }
 
 // Height returns the latest block height. If blockchain is empty nil is returned.
@@ -430,7 +410,7 @@ func (b *Blockchain) store(
 		if err != nil {
 			return err
 		}
-		if err := st.Update(block.Number, stateUpdate, newClasses, false); err != nil {
+		if err := st.Update(block.Header, stateUpdate, newClasses, false); err != nil {
 			return err
 		}
 
@@ -705,24 +685,38 @@ func (b *Blockchain) StateAtBlockNumber(
 		return nil, nil, err
 	}
 
-	return core.NewDeprecatedStateHistory(
-		core.NewDeprecatedState(txn),
-		blockNumber,
-	), noopStateCloser, nil
+	if !b.StateFactory.UseNewState() {
+		return core.NewDeprecatedStateHistory(
+			core.NewDeprecatedState(txn), blockNumber,
+		), noopStateCloser, nil
+	}
+
+	height, err := core.GetChainHeight(txn)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	header, err := core.GetBlockHeaderByNumber(txn, height)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	history, err := state.NewStateHistory(blockNumber, header.GlobalStateRoot, b.stateDB)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &history, noopStateCloser, nil
 }
 
 // StateAtBlockHash returns a StateReader that provides
 // a stable view to the state at the given block hash
 func (b *Blockchain) StateAtBlockHash(
-	// todo: this should be *felt.Hash or *felt.BlockHash
 	blockHash *felt.Felt,
 ) (core.StateReader, StateCloser, error) {
 	b.listener.OnRead("StateAtBlockHash")
 	if blockHash.IsZero() {
-		memDB := memory.New()
-		txn := memDB.NewIndexedBatch()
-		emptyState := core.NewDeprecatedState(txn)
-		return emptyState, noopStateCloser, nil
+		emptyState, err := b.StateFactory.EmptyState()
+		return emptyState, noopStateCloser, err
 	}
 
 	txn := b.database.NewIndexedBatch()
@@ -730,11 +724,28 @@ func (b *Blockchain) StateAtBlockHash(
 	if err != nil {
 		return nil, nil, err
 	}
+	if !b.StateFactory.UseNewState() {
+		return core.NewDeprecatedStateHistory(
+			core.NewDeprecatedState(txn),
+			header.Number,
+		), noopStateCloser, nil
+	}
 
-	return core.NewDeprecatedStateHistory(
-		core.NewDeprecatedState(txn),
-		header.Number,
-	), noopStateCloser, nil
+	height, err := core.GetChainHeight(txn)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	headHeader, err := core.GetBlockHeaderByNumber(txn, height)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	history, err := state.NewStateHistory(header.Number, headHeader.GlobalStateRoot, b.stateDB)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &history, noopStateCloser, nil
 }
 
 // EventFilter returns an EventFilter object that is tied to a snapshot of the blockchain
@@ -891,18 +902,21 @@ func (b *Blockchain) revertHead(batch db.Batch) error {
 		return err
 	}
 
+	header, err := core.GetBlockHeaderByNumber(b.database, blockNumber)
+	if err != nil {
+		return err
+	}
+
 	state, err := state.New(stateUpdate.NewRoot, b.stateDB, batch)
 	if err != nil {
 		return err
 	}
-
 	// revert state
-	if err = state.Revert(blockNumber, stateUpdate); err != nil {
+	if err = state.Revert(header, stateUpdate); err != nil {
 		return err
 	}
 
-	header, err := core.GetBlockHeaderByNumber(b.database, blockNumber)
-	if err != nil {
+	if err = revertCasmHashMetadata(b.database, batch, stateUpdate); err != nil {
 		return err
 	}
 
