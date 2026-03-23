@@ -86,7 +86,7 @@ type Blockchain struct {
 	cachedFilters     *AggregatedBloomFilterCache
 	runningFilter     *core.RunningEventFilter
 	transactionLayout core.TransactionLayout
-	StateFactory      *statefactory.StateFactory
+	stateFactory      *statefactory.StateFactory
 }
 
 func New(database db.KeyValueStore, network *utils.Network, stateVersion bool) *Blockchain {
@@ -115,7 +115,7 @@ func New(database db.KeyValueStore, network *utils.Network, stateVersion bool) *
 		cachedFilters:     &cachedFilters,
 		runningFilter:     runningFilter,
 		transactionLayout: core.TransactionLayoutPerTx, // default to per-tx for backward compatibility
-		StateFactory:      stateFactory,
+		stateFactory:      stateFactory,
 	}
 }
 
@@ -322,7 +322,7 @@ func (b *Blockchain) Store(
 ) error {
 	// old state
 	// TODO(maksymmalick): remove this once we have a new state implementation
-	if !b.StateFactory.UseNewState() {
+	if !b.stateFactory.UseNewState() {
 		return b.deprecatedStore(block, blockCommitments, stateUpdate, newClasses)
 	}
 
@@ -406,7 +406,7 @@ func (b *Blockchain) store(
 			return err
 		}
 
-		st, err := b.StateFactory.NewState(stateUpdate.OldRoot, nil, batch)
+		st, err := b.stateFactory.NewState(stateUpdate.OldRoot, nil, batch)
 		if err != nil {
 			return err
 		}
@@ -667,9 +667,9 @@ func (b *Blockchain) HeadState() (core.StateReader, StateCloser, error) {
 		return nil, nil, err
 	}
 
-	state, err := b.StateFactory.NewState(header.GlobalStateRoot, txn, nil)
+	st, err := b.stateFactory.NewStateReader(header.GlobalStateRoot, txn)
 
-	return state, noopStateCloser, err
+	return st, noopStateCloser, err
 }
 
 // StateAtBlockNumber returns a StateReader that provides
@@ -685,12 +685,6 @@ func (b *Blockchain) StateAtBlockNumber(
 		return nil, nil, err
 	}
 
-	if !b.StateFactory.UseNewState() {
-		return core.NewDeprecatedStateHistory(
-			core.NewDeprecatedState(txn), blockNumber,
-		), noopStateCloser, nil
-	}
-
 	height, err := core.GetChainHeight(txn)
 	if err != nil {
 		return nil, nil, err
@@ -701,11 +695,11 @@ func (b *Blockchain) StateAtBlockNumber(
 		return nil, nil, err
 	}
 
-	history, err := state.NewStateHistory(blockNumber, header.GlobalStateRoot, b.stateDB)
+	st, err := b.stateFactory.NewStateHistory(header.GlobalStateRoot, txn, blockNumber)
 	if err != nil {
 		return nil, nil, err
 	}
-	return &history, noopStateCloser, nil
+	return st, noopStateCloser, nil
 }
 
 // StateAtBlockHash returns a StateReader that provides
@@ -715,7 +709,7 @@ func (b *Blockchain) StateAtBlockHash(
 ) (core.StateReader, StateCloser, error) {
 	b.listener.OnRead("StateAtBlockHash")
 	if blockHash.IsZero() {
-		emptyState, err := b.StateFactory.EmptyState()
+		emptyState, err := b.stateFactory.EmptyState()
 		return emptyState, noopStateCloser, err
 	}
 
@@ -724,13 +718,6 @@ func (b *Blockchain) StateAtBlockHash(
 	if err != nil {
 		return nil, nil, err
 	}
-	if !b.StateFactory.UseNewState() {
-		return core.NewDeprecatedStateHistory(
-			core.NewDeprecatedState(txn),
-			header.Number,
-		), noopStateCloser, nil
-	}
-
 	height, err := core.GetChainHeight(txn)
 	if err != nil {
 		return nil, nil, err
@@ -741,11 +728,11 @@ func (b *Blockchain) StateAtBlockHash(
 		return nil, nil, err
 	}
 
-	history, err := state.NewStateHistory(header.Number, headHeader.GlobalStateRoot, b.stateDB)
+	st, err := b.stateFactory.NewStateHistory(headHeader.GlobalStateRoot, txn, header.Number)
 	if err != nil {
 		return nil, nil, err
 	}
-	return &history, noopStateCloser, nil
+	return st, noopStateCloser, nil
 }
 
 // EventFilter returns an EventFilter object that is tied to a snapshot of the blockchain
@@ -775,14 +762,14 @@ func (b *Blockchain) EventFilter(
 
 // RevertHead reverts the head block
 func (b *Blockchain) RevertHead() error {
-	if !b.StateFactory.UseNewState() {
+	if !b.stateFactory.UseNewState() {
 		return b.database.Update(b.deprecatedRevertHead)
 	}
 	return b.database.Write(b.revertHead)
 }
 
 func (b *Blockchain) GetReverseStateDiff() (core.StateDiff, error) {
-	if !b.StateFactory.UseNewState() {
+	if !b.stateFactory.UseNewState() {
 		return b.deprecatedGetReverseStateDiff()
 	}
 
@@ -822,12 +809,12 @@ func (b *Blockchain) getReverseStateDiff() (core.StateDiff, error) {
 	if err != nil {
 		return ret, err
 	}
-	state, err := state.New(stateUpdate.NewRoot, b.stateDB, nil)
+	st, err := state.NewStateReader(stateUpdate.NewRoot, b.stateDB)
 	if err != nil {
 		return ret, err
 	}
 
-	return state.GetReverseStateDiff(blockNum, stateUpdate.StateDiff)
+	return st.GetReverseStateDiff(blockNum, stateUpdate.StateDiff)
 }
 
 func (b *Blockchain) deprecatedRevertHead(txn db.IndexedBatch) error {
@@ -972,7 +959,14 @@ func (b *Blockchain) Simulate(
 	txn := b.database.NewIndexedBatch()
 	defer txn.Close()
 
-	if err := b.updateStateRoots(txn, nil, block, stateUpdate, newClasses); err != nil {
+	// For the new state path, create a temporary batch that is intentionally never
+	// committed — writes accumulate in memory and are discarded after simulation.
+	var batch db.Batch
+	if b.stateFactory.UseNewState() {
+		batch = b.database.NewBatch()
+	}
+
+	if err := b.updateStateRoots(txn, batch, block, stateUpdate, newClasses); err != nil {
 		return SimulateResult{}, err
 	}
 
@@ -1005,7 +999,7 @@ func (b *Blockchain) Finalise(
 	newClasses map[felt.Felt]core.ClassDefinition,
 	sign utils.BlockSignFunc,
 ) error {
-	if !b.StateFactory.UseNewState() {
+	if !b.stateFactory.UseNewState() {
 		err := b.database.Update(func(txn db.IndexedBatch) error {
 			if err := b.updateStateRoots(txn, nil, block, stateUpdate, newClasses); err != nil {
 				return err
@@ -1101,7 +1095,7 @@ func (b *Blockchain) updateStateRoots(
 		stateRoot = &felt.Zero
 	}
 
-	state, err := b.StateFactory.NewState(stateRoot, txn, batch)
+	state, err := b.stateFactory.NewState(stateRoot, txn, batch)
 	if err != nil {
 		return err
 	}
