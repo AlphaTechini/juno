@@ -72,6 +72,21 @@ func (mr *MockStarknetDataMockRecorder) BlockLatest(ctx any) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BlockLatest", reflect.TypeOf((*MockStarknetData)(nil).BlockLatest), ctx)
 }
 
+// BlockLatestHeader mocks base method.
+func (m *MockStarknetData) BlockLatestHeader(ctx context.Context) (core.Header, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "BlockLatestHeader", ctx)
+	ret0, _ := ret[0].(core.Header)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// BlockLatestHeader indicates an expected call of BlockLatestHeader.
+func (mr *MockStarknetDataMockRecorder) BlockLatestHeader(ctx any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BlockLatestHeader", reflect.TypeOf((*MockStarknetData)(nil).BlockLatestHeader), ctx)
+}
+
 // BlockPending mocks base method.
 func (m *MockStarknetData) BlockPending(ctx context.Context) (*core.Block, error) {
 	m.ctrl.T.Helper()
